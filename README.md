@@ -86,6 +86,70 @@ Each ball:
 
 ---
 
+
+## Visual Tracking Aids (Green Ball, Target, Vision Field)
+
+To make the dynamics of the system easier to follow by eye, the simulation highlights **one arbitrary ball** in each field.
+
+### Green Ball (Tracked Agent)
+
+- One ball is colored **green**
+- This ball is **not special** in any algorithmic sense
+- It follows exactly the same rules as all other balls
+- Its purpose is purely **visual tracking**
+
+The green ball allows the observer to:
+- Follow a single agent continuously
+- Visually assess how avoidance affects its trajectory
+- Compare behavior between the left and right fields
+
+---
+
+### Gray Target Marker
+
+For the green ball, its current target is explicitly visualized:
+
+- The target is shown as a **gray cross inside a gray circle**
+- This marker indicates **where the ball is currently trying to go**
+- When the ball reaches this target, a new one is immediately assigned
+
+The target visualization helps distinguish:
+- Deviations caused by collision avoidance
+- Natural direction changes due to target switching
+
+---
+
+### Vision Field (Gray Circle)
+
+Around the green ball, a **faint gray circle** is drawn.
+
+This circle represents the **vision radius** of the ball:
+
+- Radius = **10 × R**
+- Only balls inside this circle are:
+  - Visible to the green ball
+  - Considered in collision prediction
+- Balls outside this circle are completely ignored by the ball’s decision process
+
+This visualization emphasizes that:
+- The system operates on **local information only**
+- No ball has global awareness of the field
+- Collective behavior emerges from overlapping local neighborhoods
+
+---
+
+### Why This Matters
+
+Together, the green ball, its target marker, and its vision field make it possible to:
+
+- Intuitively understand local perception constraints
+- See how avoidance alters trajectories relative to the target
+- Observe congestion and interaction effects forming dynamically
+
+These visual aids are **diagnostic tools only** and do not affect the experiment’s logic or statistics.
+
+---
+
 ## What Counts as a Collision
 
 A collision is defined geometrically: distance between centers < R
