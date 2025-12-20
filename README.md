@@ -10,7 +10,7 @@ The experiment compares two identical populations of moving agents (“balls”)
 - **Left field** — baseline motion *without* collision avoidance  
 - **Right field** — motion *with* collision-avoidance mechanisms enabled  
 
-The goal is **not** to present a single optimal avoidance algorithm, but to provide a controlled environment for **quantitative comparison** of collision rates and motion efficiency under increasing behavioral constraints.
+The goal is to assess collision rates and motion efficiency of an avoidance algorithm.
 
 ---
 
@@ -47,7 +47,7 @@ Each ball follows the same high-level motion cycle:
 
 1. A random target point is selected inside the arena.
 2. The ball moves toward the target with bounded turning angle and bounded speed change.
-3. When the ball reaches the target (distance ≤ `1.5 × speed`), a new target is chosen.
+3. When the ball reaches the target (distance ≤ `1.5 × step_size`), a new target is chosen.
 4. The number of frames spent traveling to the target is recorded.
 
 ### Motion Constraints
@@ -74,9 +74,6 @@ Each ball follows the same high-level motion cycle:
 - Avoidance logic operates locally and predictively.
 - Internal logic is layered and adaptive.
 
-> ⚠️ This README intentionally avoids detailing the internal avoidance strategy.  
-> The experiment is designed to evaluate **outcomes**, not promote a specific algorithm.
-
 ---
 
 ## Vision Radius (Local Information)
@@ -89,8 +86,6 @@ Each ball:
 - Only neighbors inside this radius are considered in:
   - Collision prediction
   - Joint decision making
-
-This models **local perception**, similar to real physical or biological systems.
 
 ---
 
