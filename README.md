@@ -1,6 +1,3 @@
-# CollisionFree
-decentralized model to avoid collisions
-
 # Multi-Agent Collision Experiment (Two-Field Comparison)
 
 This repository contains an interactive simulation designed to study **collision statistics, motion efficiency, and slowdown effects** in a dense multi-agent system.
