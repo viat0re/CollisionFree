@@ -234,6 +234,7 @@ Keyboard controls:
 - **Space** — resume after pause
 - **H** — toggle visualization of interaction components
 - **L** — toggle logging of interaction structure
+- **+/-** — increase/decrease visualization speed
 
 When a significant collision occurs in the right field, the simulation pauses and automatically generates diagnostic snapshots and logs for post-analysis.
 
@@ -246,11 +247,6 @@ When a significant collision occurs in the right field, the simulation pauses an
 - No external backend
 - Runs directly in the browser
 
----
 
-## License
-
-Use freely for research, experimentation, and exploration.
-Attribution appreciated.
 
 
