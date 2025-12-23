@@ -1,0 +1,2336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Two Fields with Moving Balls</title>
+  <style>
+    body {
+      background: #111;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      height: 100vh;
+      margin: 0;
+      color: #eee;
+      font-family: sans-serif;
+    }
+    #wrapper {
+      display: flex;
+      gap: 40px;
+      align-items: flex-start;
+      margin-top: 20px;
+    }
+    .panel {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .panel-title {
+      margin-bottom: 8px;
+      font-weight: bold;
+      font-size: 16px;
+    }
+    canvas {
+      background: #ffffff;
+      border: 1px solid #000000;
+    }
+    .stats-block {
+      margin-top: 8px;
+      text-align: center;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+  <div id="wrapper">
+    <div class="panel">
+      <div class="panel-title">No collision avoidance</div>
+      <canvas id="field1" width="500" height="500"></canvas>
+      <div class="stats-block">
+        <div id="stats-left-coll">Collisions/10s: 0.00</div>
+        <div id="stats-left-frames">Avg frames to target: 0.0</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Avoid collisions</div>
+      <canvas id="field2" width="500" height="500"></canvas>
+      <div class="stats-block">
+        <div id="stats-right-coll">Collisions/10s: 0.00</div>
+        <div id="stats-right-frames">Avg frames to target: 0.0</div>
+        <div id="stats-right-layer2">Layer-2 usage: 0.000</div>
+        <div id="stats-right-layer3">Layer-3 usage: 0.000</div>
+        <div id="stats-right-emergency">Emergency events: 0</div>
+        <div id="stats-right-sharp">Sharp-turn collisions (total): 0</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats-block" id="hotkeys">
+    Hotkeys: Space - resume after pause; H - toggle L4 components highlight; L - toggle L4 components logging; + / - - faster / slower visualization (caps at default, can slow to 0).
+  </div>
+
+  <script>
+  window.addEventListener('load', () => {
+    const WIDTH = 500;
+    const HEIGHT = 500;
+    const NUM_BALLS = 50;
+    const RADIUS = 10;
+    const BASE_SPEED = RADIUS;
+
+    const TRACK_LEFT_INDEX = 0;
+    const TRACK_RIGHT_INDEX = 0;
+
+    const canvas1 = document.getElementById('field1');
+    const ctx1 = canvas1.getContext('2d');
+    const canvas2 = document.getElementById('field2');
+    const ctx2 = canvas2.getContext('2d');
+
+    const statsLeftCollDiv = document.getElementById('stats-left-coll');
+    const statsLeftFramesDiv = document.getElementById('stats-left-frames');
+    const statsRightCollDiv = document.getElementById('stats-right-coll');
+    const statsRightFramesDiv = document.getElementById('stats-right-frames');
+    const statsRightLayer2Div = document.getElementById('stats-right-layer2');
+    const statsRightLayer3Div = document.getElementById('stats-right-layer3');
+    const statsRightEmergencyDiv = document.getElementById('stats-right-emergency');
+    const statsRightSharpDiv = document.getElementById('stats-right-sharp');
+
+    function randomInRange(a, b) {
+      return Math.random() * (b - a) + a;
+    }
+
+    function randomPos() {
+      return {
+        x: randomInRange(RADIUS, WIDTH - RADIUS),
+        y: randomInRange(RADIUS, HEIGHT - RADIUS)
+      };
+    }
+
+    const AVOID_DIST = 2 * RADIUS;
+    const TOUCH2_AVOID = AVOID_DIST * AVOID_DIST;
+    const TOUCH2_COLLIDE = RADIUS * RADIUS;
+    const BORDER_SAFE = 2 * BASE_SPEED;
+
+    const MAX_NEIGHBOR_DIST = 10*RADIUS;
+    const MAX_NEIGHBOR_DIST2 = MAX_NEIGHBOR_DIST * MAX_NEIGHBOR_DIST;
+
+    const L4_CONNECT_DIST = 1.25 * RADIUS;
+    const L4_CONNECT_DIST2 = L4_CONNECT_DIST * L4_CONNECT_DIST;
+
+    const DISCOUNT_A = 0.9;
+
+    const WINDOW_MS = 10000;
+    const leftCollisionTimes = [];
+    const rightCollisionTimes = [];
+
+    let paused = false;
+    let pendingCollisionPair = null;
+
+    // === VISUALIZATION RATE CONTROL (visual only; does NOT change the model) ===
+    // Controls real-time pacing of iterations. Model step is unchanged.
+    // '-' slows down to 0 (freeze), '+' speeds up back to DEFAULT_VIS_FPS (cap).
+    const DEFAULT_VIS_FPS = 60;
+    let visFps = DEFAULT_VIS_FPS;
+
+    function requestNextFrame() {
+      if (paused) return;
+      if (visFps <= 0) {
+        // Frozen: redraw rarely (still lets you see the final state).
+        setTimeout(() => requestAnimationFrame(loop), 50);
+        return;
+      }
+      // Add extra delay compared to default pacing.
+      // When visFps == DEFAULT_VIS_FPS -> delay = 0.
+      const extraDelayMs = Math.max(0, Math.round((1000 / visFps) - (1000 / DEFAULT_VIS_FPS)));
+      if (extraDelayMs > 0) {
+        setTimeout(() => requestAnimationFrame(loop), extraDelayMs);
+      } else {
+        requestAnimationFrame(loop);
+      }
+    }
+
+
+    let sharpTurnCollisionsTotal = 0;
+
+    // === ���������� (������� ���������� ��������) ===
+    const ACTION_ANGLES = [-45, -30, -15, 0, 15, 30, 45];
+    const ACTION_DVS = [-1, 0, 1];
+
+    const ALL_CONTROLS = [];
+    for (const angleDeg of ACTION_ANGLES) {
+      for (const dv of ACTION_DVS) {
+        ALL_CONTROLS.push({ angle: angleDeg, dv });
+      }
+    }
+
+    function controlKey(angleDeg, dv) {
+      return `angle=${angleDeg},dv=${dv}`;
+    }
+
+    // === ������� ������ ���������� (score) � ������� ����������� ���������� ===
+    const controlScoreHistory = Array.from({ length: NUM_BALLS }, () => []); // [{ key->score }, ...]
+    const usedControlHistory   = Array.from({ length: NUM_BALLS }, () => []); // "angle=...,dv=...,emergency=0/1"
+    const layerDetailsHistory = Array.from({ length: NUM_BALLS }, () => []); // per-step breakdown of layers
+
+    function drawDestination(ctx, x, y) {
+      const r = RADIUS * 1.8;
+      ctx.strokeStyle = 'gray';
+      ctx.lineWidth = 1;
+
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(x - r, y);
+      ctx.lineTo(x + r, y);
+      ctx.moveTo(x, y - r);
+      ctx.lineTo(x, y + r);
+      ctx.stroke();
+    }
+
+    function drawTargetSign(ctx, x, y, color, radius) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(x - radius, y - radius);
+      ctx.lineTo(x + radius, y + radius);
+      ctx.moveTo(x - radius, y + radius);
+      ctx.lineTo(x + radius, y - radius);
+      ctx.stroke();
+    }
+
+    function drawArrow(ctx, x, y, vx, vy, color = 'gray') {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+
+      const arrowScale = 10;
+      const len = Math.hypot(vx, vy) || 1;
+      const ux = (vx / len) * arrowScale;
+      const uy = (vy / len) * arrowScale;
+
+      const x2 = x + ux;
+      const y2 = y + uy;
+
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      const headSize = 4;
+      const angle = Math.atan2(uy, ux);
+      const leftAngle = angle + Math.PI * 0.75;
+      const rightAngle = angle - Math.PI * 0.75;
+
+      const xLeft = x2 + headSize * Math.cos(leftAngle);
+      const yLeft = y2 * 1 + headSize * Math.sin(leftAngle);
+      const xRight = x2 + headSize * Math.cos(rightAngle);
+      const yRight = y2 + headSize * Math.sin(rightAngle);
+
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(xLeft, yLeft);
+      ctx.lineTo(xRight, yRight);
+      ctx.closePath();
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    function downloadCanvasAsPNG(canvas, filename) {
+      const url = canvas.toDataURL('image/png');
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    const MAX_TURN_DEG = 45;
+    const MAX_TURN_RAD = MAX_TURN_DEG * Math.PI / 180;
+    const COS_MAX_TURN = Math.cos(MAX_TURN_RAD);
+
+    function limitTurn(prevX, prevY, desiredX, desiredY) {
+      const dLen = Math.hypot(desiredX, desiredY) || 1;
+      let ux = desiredX / dLen;
+      let uy = desiredY / dLen;
+
+      const dot = prevX * ux + prevY * uy;
+      if (dot >= COS_MAX_TURN) {
+        return { x: ux, y: uy };
+      }
+
+      const anglePrev = Math.atan2(prevY, prevX);
+      const angleDesired = Math.atan2(uy, ux);
+      let delta = angleDesired - anglePrev;
+      if (delta > Math.PI) delta -= 2 * Math.PI;
+      if (delta <= -Math.PI) delta += 2 * Math.PI;
+
+      if (delta > MAX_TURN_RAD) delta = MAX_TURN_RAD;
+      if (delta < -MAX_TURN_RAD) delta = -MAX_TURN_RAD;
+
+      const newAngle = anglePrev + delta;
+      return { x: Math.cos(newAngle), y: Math.sin(newAngle) };
+    }
+
+    function rotateVec(x, y, angleDeg) {
+      const rad = angleDeg * Math.PI / 180;
+      const cosA = Math.cos(rad);
+      const sinA = Math.sin(rad);
+      return {
+        x: x * cosA - y * sinA,
+        y: x * sinA + y * cosA
+      };
+    }
+
+    function faintColor(col) {
+      if (col === 'red')    return 'rgba(255,0,0,0.35)';
+      if (col === 'orange') return 'rgba(255,165,0,0.35)';
+      return 'rgba(0,0,0,0.35)';
+    }
+
+    // === XLSX-������� ===
+
+    function colIndexToName(idx) {
+      let s = '';
+      let n = idx + 1;
+      while (n > 0) {
+        const r = (n - 1) % 26;
+        s = String.fromCharCode(65 + r) + s;
+        n = Math.floor((n - 1) / 26);
+      }
+      return s;
+    }
+
+    function xmlEscape(str) {
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function buildSheetXML(rows) {
+      let xml = '<?xml version="1.0" encoding="UTF-8"?>';
+      xml += '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
+      xml += '<sheetData>';
+
+      for (let r = 0; r < rows.length; r++) {
+        const row = rows[r];
+        if (!row) continue;
+        xml += `<row r="${r + 1}">`;
+        for (let c = 0; c < row.length; c++) {
+          const val = row[c];
+          if (val === null || val === undefined || val === '') continue;
+          const cellRef = colIndexToName(c) + (r + 1);
+          if (typeof val === 'number') {
+            xml += `<c r="${cellRef}"><v>${val}</v></c>`;
+          } else {
+            const esc = xmlEscape(String(val));
+            xml += `<c r="${cellRef}" t="inlineStr"><is><t>${esc}</t></is></c>`;
+          }
+        }
+        xml += '</row>';
+      }
+
+      xml += '</sheetData></worksheet>';
+      return xml;
+    }
+
+    function createCollisionLogXLSX(ballIndex1, ballIndex2) {
+      const hist1 = controlScoreHistory[ballIndex1] || [];
+      const hist2 = controlScoreHistory[ballIndex2] || [];
+      const used1 = usedControlHistory[ballIndex1] || [];
+      const used2 = usedControlHistory[ballIndex2] || [];
+
+      const maxRows = 4;
+      const n = Math.min(maxRows, hist1.length, hist2.length, used1.length, used2.length);
+      if (n <= 0) return;
+
+      const stepLabelsBase = ['t-3', 't-2', 't-1', 't'];
+      const labels = stepLabelsBase.slice(stepLabelsBase.length - n);
+
+      const header = ['step',
+        `ball_${ballIndex1}_used`,
+        `ball_${ballIndex2}_used`,
+        'l1_angle','l1_dv',
+        'l2_angle','l2_dv',
+        'l3_angle','l3_dv',
+        'rtb_angle',
+        'emerg_angle',
+        'emerg_flag',
+        'total_angle',
+        'total_dv',
+        'geom_angle',
+        'geom_dv',
+        'l4_graph_edge'
+      ];
+      for (const ctrl of ALL_CONTROLS) {
+        header.push(controlKey(ctrl.angle, ctrl.dv));
+      }
+
+      function buildRowsForBall(bIndex, otherIndex) {
+        const histSelf = controlScoreHistory[bIndex] || [];
+        const usedSelf = usedControlHistory[bIndex] || [];
+        const usedOther = usedControlHistory[otherIndex] || [];
+        const layerSelf = layerDetailsHistory[bIndex] || [];
+
+        const rows = [];
+        rows.push(header);
+
+        const startIdxSelf = histSelf.length - n;
+        const startIdxUsedSelf = usedSelf.length - n;
+        const startIdxUsedOther = usedOther.length - n;
+        const startIdxLayerSelf = layerSelf.length - n;
+
+        for (let r = 0; r < n; r++) {
+          const label = labels[r];
+          const row = [];
+          row.push(label);
+          row.push(usedSelf[startIdxUsedSelf + r] || '');
+          row.push(usedOther[startIdxUsedOther + r] || '');
+
+          const layerInfo = layerSelf[startIdxLayerSelf + r] || {};
+          const geomAng = (layerInfo && 'geomAngle' in layerInfo) ? layerInfo.geomAngle : '';
+          const geomDv  = (layerInfo && 'geomDv' in layerInfo) ? layerInfo.geomDv : '';
+
+          row.push(
+            layerInfo.l1Angle ?? '',
+            layerInfo.l1Dv ?? '',
+            layerInfo.l2Angle ?? '',
+            layerInfo.l2Dv ?? '',
+            layerInfo.l3Angle ?? '',
+            layerInfo.l3Dv ?? '',
+            layerInfo.rtbAngle ?? '',
+            layerInfo.emergAngle ?? '',
+            layerInfo.emergFlag ?? '',
+            layerInfo.totalAngle ?? '',
+            layerInfo.totalDv ?? '',
+            geomAng,
+            geomDv,
+            layerInfo.graphEdge ?? ''
+          );
+
+          const obj = histSelf[startIdxSelf + r] || {};
+          for (const ctrl of ALL_CONTROLS) {
+            const key = controlKey(ctrl.angle, ctrl.dv);
+            const v = obj[key];
+            if (typeof v === 'number' && isFinite(v)) {
+              row.push(+v.toFixed(3));
+            } else {
+              row.push('');
+            }
+          }
+          rows.push(row);
+        }
+        return rows;
+      }
+
+      const rows1 = buildRowsForBall(ballIndex1, ballIndex2);
+      const rows2 = buildRowsForBall(ballIndex2, ballIndex1);
+
+      const sheet1xml = buildSheetXML(rows1);
+      const sheet2xml = buildSheetXML(rows2);
+
+      const workbookXml =
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<sheets>' +
+        `<sheet name="Ball_${ballIndex1}" sheetId="1" r:id="rId1"/>` +
+        `<sheet name="Ball_${ballIndex2}" sheetId="2" r:id="rId2"/>` +
+        '</sheets></workbook>';
+
+      const workbookRelsXml =
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>' +
+        '</Relationships>';
+
+      const rootRelsXml =
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+        '</Relationships>';
+
+      const contentTypesXml =
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+        '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+        '</Types>';
+
+      const zip = new JSZip();
+      zip.file('[Content_Types].xml', contentTypesXml);
+      zip.folder('_rels').file('.rels', rootRelsXml);
+
+      const xlFolder = zip.folder('xl');
+      xlFolder.file('workbook.xml', workbookXml);
+      xlFolder.folder('_rels').file('workbook.xml.rels', workbookRelsXml);
+      const wsFolder = xlFolder.folder('worksheets');
+      wsFolder.file('sheet1.xml', sheet1xml);
+      wsFolder.file('sheet2.xml', sheet2xml);
+
+      zip.generateAsync({ type: 'blob' }).then(blob => {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `collision_controls_pair_${ballIndex1}_${ballIndex2}.xlsx`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      });
+    }
+
+    /* ================= LEFT FIELD ================= */
+
+    function createBallLeft() {
+      const p = randomPos();
+      const b = {
+        x: p.x,
+        y: p.y,
+        targetX: 0,
+        targetY: 0,
+        dx: 0,
+        dy: 0,
+        speed: BASE_SPEED,
+        colliding: false,
+        framesSinceTarget: 0
+      };
+      pickTargetLeft(b);
+      return b;
+    }
+
+    function pickTargetLeft(b) {
+      const t = randomPos();
+      b.targetX = t.x;
+      b.targetY = t.y;
+      b.speed = BASE_SPEED;
+      const vx = b.targetX - b.x;
+      const vy = b.targetY - b.y;
+      const L = Math.hypot(vx, vy) || 1;
+      b.dx = (vx / L) * b.speed;
+      b.dy = (vy / L) * b.speed;
+      b.framesSinceTarget = 0;
+    }
+
+    const ballsLeft = Array.from({ length: NUM_BALLS }, createBallLeft);
+    let prevPairsLeft = new Set();
+    let totalFramesLeft = 0;
+    let completedTripsLeft = 0;
+
+    function updateLeft() {
+      for (const b of ballsLeft) {
+        b.framesSinceTarget++;
+
+        const d = Math.hypot(b.targetX - b.x, b.targetY - b.y);
+        if (d <= 1.5 * b.speed) {
+          b.x = b.targetX;
+          b.y = b.targetY;
+
+          totalFramesLeft += b.framesSinceTarget;
+          completedTripsLeft++;
+
+          pickTargetLeft(b);
+        } else {
+          let newX = b.x + b.dx;
+          let newY = b.y + b.dy;
+
+          if (newX < RADIUS) newX = RADIUS;
+          if (newX > WIDTH - RADIUS) newX = WIDTH - RADIUS;
+          if (newY < RADIUS) newY = RADIUS;
+          if (newY > HEIGHT - RADIUS) newY = HEIGHT - RADIUS;
+
+          b.x = newX;
+          b.y = newY;
+        }
+      }
+
+      for (const b of ballsLeft) b.colliding = false;
+      const newPairs = new Set();
+      let add = 0;
+
+      const now = performance.now();
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        for (let j = i + 1; j < NUM_BALLS; j++) {
+          const bi = ballsLeft[i];
+          const bj = ballsLeft[j];
+          const dx = bi.x - bj.x;
+          const dy = bi.y - bj.y;
+          if (dx * dx + dy * dy <= TOUCH2_COLLIDE) {
+            bi.colliding = bj.colliding = true;
+            const key = i + "-" + j;
+            newPairs.add(key);
+            if (!prevPairsLeft.has(key)) add++;
+          }
+        }
+      }
+
+      prevPairsLeft = newPairs;
+
+      for (let k = 0; k < add; k++) {
+        leftCollisionTimes.push(now);
+      }
+      while (leftCollisionTimes.length > 0 &&
+             leftCollisionTimes[0] < now - WINDOW_MS) {
+        leftCollisionTimes.shift();
+      }
+
+      const rate10 = leftCollisionTimes.length / 10;
+      statsLeftCollDiv.textContent = `Collisions/10s: ${rate10.toFixed(2)}`;
+
+      const avgFrames =
+        completedTripsLeft > 0 ? totalFramesLeft / completedTripsLeft : 0;
+      statsLeftFramesDiv.textContent =
+        `Avg frames to target: ${avgFrames.toFixed(1)}`;
+    }
+
+    function drawLeft() {
+      ctx1.clearRect(0, 0, WIDTH, HEIGHT);
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const b = ballsLeft[i];
+        ctx1.beginPath();
+        ctx1.arc(b.x, b.y, RADIUS, 0, Math.PI * 2);
+
+        if (i === TRACK_LEFT_INDEX) {
+          ctx1.fillStyle = 'green';
+        } else {
+          ctx1.fillStyle = b.colliding ? "red" : "black";
+        }
+        ctx1.fill();
+
+        // faint view circle around green ball on the left
+        if (i === TRACK_LEFT_INDEX) {
+          ctx1.beginPath();
+          ctx1.arc(b.x, b.y, MAX_NEIGHBOR_DIST, 0, Math.PI * 2);
+          ctx1.strokeStyle = "rgba(180,180,180,0.25)";
+          ctx1.lineWidth = 1;
+          ctx1.stroke();
+        }
+      }
+
+      const tb = ballsLeft[TRACK_LEFT_INDEX];
+      drawDestination(ctx1, tb.targetX, tb.targetY);
+    }
+
+    /* ================= RIGHT FIELD ================= */
+
+    const PRED_STEPS = 10;
+    const EMERGENCY_STEPS = 4;
+
+    // Store L4 (post-layer-4 emergency) velocity vectors for the last executed step,
+    // plus info about layer-4 connected components and visualization/logging toggles.
+    let lastStepL4Vx = null;
+    let lastStepL4Vy = null;
+    let lastL4ComponentId = new Array(NUM_BALLS).fill(-1);
+    let lastL4EdgeFlag = new Array(NUM_BALLS).fill(0);
+    let lastL4Edges = [];
+    let highlightL4Components = true;
+    let logL4ComponentsToConsole = false;
+    const L4_COMPONENT_COLORS = ['#00aa00','#aa00aa','#0000aa','#ff8800','#008888','#880000'];
+
+    // store previous directions used in L4 (for later visualization)
+    let lastPrevDirX = null;
+    let lastPrevDirY = null;
+
+    let lastL4PosX = null;
+    let lastL4PosY = null;
+    let lastL4Speed = null;
+
+    function clampDv(dv) {
+      if (dv > 1) return 1;
+      if (dv < -1) return -1;
+      return dv;
+    }
+
+    function createBallRight() {
+      const p = randomPos();
+      const b = {
+        x: p.x,
+        y: p.y,
+        targetX: 0,
+        targetY: 0,
+
+        prevTargetX: 0,
+        prevTargetY: 0,
+        alreadyHasTarget: false,
+
+        stepsSinceTargetChange: 0,
+
+        baseDirX: 0,
+        baseDirY: 0,
+        dirX: 1,
+        dirY: 0,
+
+        baseSpeed: BASE_SPEED,
+        speed: BASE_SPEED,
+
+        collisionType: 'none',
+        collisionRole: 'none',
+
+        framesSinceTarget: 0,
+        
+        isSecondLevel: false,
+
+        history: [],
+
+        emergencyTimer: 0,
+        emergencyDirX: 1,
+        emergencyDirY: 0,
+        immediateCollisionsForecast: 0
+      };
+      pickTargetRight(b);
+      return b;
+    }
+
+    function pickTargetRight(b) {
+      const t = randomPos();
+
+      if (b.alreadyHasTarget) {
+        b.prevTargetX = b.targetX;
+        b.prevTargetY = b.targetY;
+      }
+
+      b.targetX = t.x;
+      b.targetY = t.y;
+      b.alreadyHasTarget = true;
+
+      b.baseSpeed = BASE_SPEED;
+      b.speed = b.baseSpeed;
+
+      const vx = t.x - b.x;
+      const vy = t.y - b.y;
+      const L = Math.hypot(vx, vy) || 1;
+      b.baseDirX = vx / L;
+      b.baseDirY = vy / L;
+
+      b.framesSinceTarget = 0;
+      b.stepsSinceTargetChange = 0;
+    }
+
+    const ballsRight = Array.from({ length: NUM_BALLS }, createBallRight);
+    let prevPairsRight = new Set();
+
+    let totalFramesRight = 0;
+    let completedTripsRight = 0;
+
+    let layer2Usage = 0;
+    let layer3Usage = 0;
+    let layerFrames = 0;
+
+    let emergencyEvents = 0;
+
+    function predictCollisionsForActionLong(
+      index,
+      angleDeg,
+      dv,
+      prevDirX,
+      prevDirY
+    ) {
+      const self = ballsRight[index];
+
+      const des = rotateVec(prevDirX[index], prevDirY[index], angleDeg);
+      const lim = limitTurn(prevDirX[index], prevDirY[index], des.x, des.y);
+      const dirX = lim.x;
+      const dirY = lim.y;
+
+      const speed = Math.max(1, self.baseSpeed + dv);
+
+      let x = self.x;
+      let y = self.y;
+      let collisions = 0;
+      let step1Collisions = 0;
+
+      for (let step = 1; step <= PRED_STEPS; step++) {
+        const dxT = self.targetX - x;
+        const dyT = self.targetY - y;
+        const distT = Math.hypot(dxT, dyT);
+        if (distT <= speed) {
+          x = self.targetX;
+          y = self.targetY;
+        } else {
+          x += dirX * speed;
+          y += dirY * speed;
+
+          if (x < RADIUS) x = RADIUS;
+          if (x > WIDTH - RADIUS) x = WIDTH - RADIUS;
+          if (y < RADIUS) y = RADIUS;
+          if (y > HEIGHT - RADIUS) y = HEIGHT - RADIUS;
+        }
+
+        for (let j = 0; j < NUM_BALLS; j++) {
+          if (j === index) continue;
+          const other = ballsRight[j];
+
+          const dx0 = self.x - other.x;
+          const dy0 = self.y - other.y;
+          if (dx0 * dx0 + dy0 * dy0 > MAX_NEIGHBOR_DIST2) continue;
+
+          const ox = other.x + other.dirX * other.speed * step;
+          const oy = other.y + other.dirY * other.speed * step;
+
+          const dx = x - ox;
+          const dy = y - oy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 <= TOUCH2_COLLIDE) {
+            const weight = Math.pow(DISCOUNT_A, step - 1);
+            collisions += weight * 1000;
+            if (step === 1) step1Collisions += 1000;
+          } else if (d2 <= TOUCH2_AVOID) {
+            const weight = Math.pow(DISCOUNT_A, step - 1);
+            collisions += weight;
+            if (step === 1) step1Collisions++;
+          }
+        }
+      }
+
+      return { collisions, step1Collisions };
+    }
+
+    function predictCollisionsForActionShort(
+      index,
+      angleDeg2,
+      dv2,
+      chosenAngles1,
+      chosenDvs1,
+      prevDirX,
+      prevDirY
+    ) {
+      const plannedDirX = new Array(NUM_BALLS);
+      const plannedDirY = new Array(NUM_BALLS);
+      const plannedSpeed = new Array(NUM_BALLS);
+
+      for (let j = 0; j < NUM_BALLS; j++) {
+        const b = ballsRight[j];
+        const ang1 = chosenAngles1[j];
+        const dv1 = chosenDvs1[j];
+
+        const des = rotateVec(prevDirX[j], prevDirY[j], ang1);
+        const lim = limitTurn(prevDirX[j], prevDirY[j], des.x, des.y);
+
+        plannedDirX[j] = lim.x;
+        plannedDirY[j] = lim.y;
+        plannedSpeed[j] = Math.max(1, b.baseSpeed + dv1);
+      }
+
+      const self = ballsRight[index];
+
+      const ang1s = chosenAngles1[index];
+      const dv1s = chosenDvs1[index];
+      const totalAngle = ang1s + angleDeg2;
+      const totalDv = clampDv(dv1s + dv2);
+
+      const desSelf = rotateVec(prevDirX[index], prevDirY[index], totalAngle);
+      const limSelf = limitTurn(prevDirX[index], prevDirY[index], desSelf.x, desSelf.y);
+      const selfDirX = limSelf.x;
+      const selfDirY = limSelf.y;
+      const selfSpeed = Math.max(1, self.baseSpeed + totalDv);
+
+      let x = self.x;
+      let y = self.y;
+      let collisions = 0;
+      let step1Collisions = 0;
+
+      for (let step = 1; step <= PRED_STEPS; step++) {
+        const dxT = self.targetX - x;
+        const dyT = self.targetY - y;
+        const distT = Math.hypot(dxT, dyT);
+        if (distT <= selfSpeed) {
+          x = self.targetX;
+          y = self.targetY;
+        } else {
+          x += selfDirX * selfSpeed;
+          y += selfDirY * selfSpeed;
+
+          if (x < RADIUS) x = RADIUS;
+          if (x > WIDTH - RADIUS) x = WIDTH - RADIUS;
+          if (y < RADIUS) y = RADIUS;
+          if (y > HEIGHT - RADIUS) y = HEIGHT - RADIUS;
+        }
+
+        for (let j = 0; j < NUM_BALLS; j++) {
+          if (j === index) continue;
+          const b = ballsRight[j];
+
+          const dx0 = self.x - b.x;
+          const dy0 = self.y - b.y;
+          if (dx0 * dx0 + dy0 * dy0 > MAX_NEIGHBOR_DIST2) continue;
+
+          const ox = b.x + plannedDirX[j] * plannedSpeed[j] * step;
+          const oy = b.y + plannedDirY[j] * plannedSpeed[j] * step;
+
+          const dx = x - ox;
+          const dy = y - oy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 <= TOUCH2_COLLIDE) {
+            const weight = Math.pow(DISCOUNT_A, step - 1);
+            collisions += weight * 1000;
+            if (step === 1) step1Collisions += 1000;
+          } else if (d2 <= TOUCH2_AVOID) {
+            const weight = Math.pow(DISCOUNT_A, step - 1);
+            collisions += weight;
+            if (step === 1) step1Collisions++;
+          }
+        }
+      }
+
+      return { collisions, step1Collisions };
+    }
+
+    function predictCollisionsForActionThird(
+      index,
+      angleDeg3,
+      dv3,
+      chosenAngles1,
+      chosenDvs1,
+      chosenAngles2,
+      chosenDvs2,
+      prevDirX,
+      prevDirY
+    ) {
+      const plannedDirX = new Array(NUM_BALLS);
+      const plannedDirY = new Array(NUM_BALLS);
+      const plannedSpeed = new Array(NUM_BALLS);
+
+      for (let j = 0; j < NUM_BALLS; j++) {
+        const b = ballsRight[j];
+        const ang1 = chosenAngles1[j];
+        const dv1 = chosenDvs1[j];
+        const ang2 = chosenAngles2[j];
+        const dv2 = chosenDvs2[j];
+
+        const angle12 = ang1 + ang2;
+        const dv12 = clampDv(dv1 + dv2);
+
+        const des = rotateVec(prevDirX[j], prevDirY[j], angle12);
+        const lim = limitTurn(prevDirX[j], prevDirY[j], des.x, des.y);
+
+        plannedDirX[j] = lim.x;
+        plannedDirY[j] = lim.y;
+        plannedSpeed[j] = Math.max(1, b.baseSpeed + dv12);
+      }
+
+      const self = ballsRight[index];
+      const a1s = chosenAngles1[index];
+      const dv1s = chosenDvs1[index];
+      const a2s = chosenAngles2[index];
+      const dv2s = chosenDvs2[index];
+      const angle12s = a1s + a2s;
+      const dv12s = clampDv(dv1s + dv2s);
+
+      const totalAngle = angle12s + angleDeg3;
+      const totalDv = clampDv(dv12s + dv3);
+
+      const desSelf = rotateVec(prevDirX[index], prevDirY[index], totalAngle);
+      const limSelf = limitTurn(prevDirX[index], prevDirY[index], desSelf.x, desSelf.y);
+      const selfDirX = limSelf.x;
+      const selfDirY = limSelf.y;
+      const selfSpeed = Math.max(1, self.baseSpeed + totalDv);
+
+      let x = self.x;
+      let y = self.y;
+      let collisions = 0;
+      let step1Collisions = 0;
+
+      for (let step = 1; step <= PRED_STEPS; step++) {
+        const dxT = self.targetX - x;
+        const dyT = self.targetY - y;
+        const distT = Math.hypot(dxT, dyT);
+        if (distT <= selfSpeed) {
+          x = self.targetX;
+          y = self.targetY;
+        } else {
+          x += selfDirX * selfSpeed;
+          y += selfDirY * selfSpeed;
+
+          if (x < RADIUS) x = RADIUS;
+          if (x > WIDTH - RADIUS) x = WIDTH - RADIUS;
+          if (y < RADIUS) y = RADIUS;
+          if (y > HEIGHT - RADIUS) y = HEIGHT - RADIUS;
+        }
+
+        for (let j = 0; j < NUM_BALLS; j++) {
+          if (j === index) continue;
+          const b = ballsRight[j];
+
+          const dx0 = self.x - b.x;
+          const dy0 = self.y - b.y;
+          if (dx0 * dx0 + dy0 * dy0 > MAX_NEIGHBOR_DIST2) continue;
+
+          const ox = b.x + plannedDirX[j] * plannedSpeed[j] * step;
+          const oy = b.y + plannedDirY[j] * plannedSpeed[j] * step;
+
+          const dx = x - ox;
+          const dy = y - oy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 <= TOUCH2_COLLIDE) {
+            const weight = Math.pow(DISCOUNT_A, step - 1);
+            collisions += weight * 1000;
+            if (step === 1) step1Collisions += 1000;
+          } else if (d2 <= TOUCH2_AVOID) {
+            const weight = Math.pow(DISCOUNT_A, step - 1);
+            collisions += weight;
+            if (step === 1) step1Collisions++;
+          }
+        }
+      }
+
+      return { collisions, step1Collisions };
+    }
+
+    function updateRight() {
+      const prevDirX = new Array(NUM_BALLS);
+      const prevDirY = new Array(NUM_BALLS);
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const b = ballsRight[i];
+        const len = Math.hypot(b.dirX, b.dirY) || 1;
+        prevDirX[i] = b.dirX / len;
+        prevDirY[i] = b.dirY / len;
+      }
+
+      // store for later visualization of L4 candidate positions
+      lastPrevDirX = prevDirX.slice();
+      lastPrevDirY = prevDirY.slice();
+
+      // plans per-layer for later union-of-layers in Layer-5
+      const planDir1X = new Array(NUM_BALLS);
+      const planDir1Y = new Array(NUM_BALLS);
+      const planSpeed1 = new Array(NUM_BALLS);
+      const planDir2X = new Array(NUM_BALLS);
+      const planDir2Y = new Array(NUM_BALLS);
+      const planSpeed2 = new Array(NUM_BALLS);
+
+      for (const b of ballsRight) {
+        const vx = b.targetX - b.x;
+        const vy = b.targetY - b.y;
+        const L = Math.hypot(vx, vy) || 1;
+        b.baseDirX = vx / L;
+        b.baseDirY = vy / L;
+        b.immediateCollisionsForecast = 0;
+      }
+
+      // STEP 0: safe controls + score (layer-0 + layer-1)
+      const safeControls = new Array(NUM_BALLS);
+      const needsEmergency = new Array(NUM_BALLS).fill(false);
+
+      const BIG_PENALTY = 1e6;
+
+      const chosenAngles1 = new Array(NUM_BALLS).fill(0);
+      const chosenDvs1 = new Array(NUM_BALLS).fill(0);
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const scoresThisStep = {};
+        const allowed = [];
+        const baseDirX = ballsRight[i].baseDirX;
+        const baseDirY = ballsRight[i].baseDirY;
+
+        let bestColl = Infinity;
+        let bestStep1 = Infinity;
+        let bestAngle = 0;
+        let bestDv = 0;
+        let bestTargetAlign = -Infinity;
+
+        for (const ctrl of ALL_CONTROLS) {
+          const angleDeg = ctrl.angle;
+          const dv = ctrl.dv;
+          const key = controlKey(angleDeg, dv);
+
+          const safe = true; // layer-0 disabled
+
+          let score;
+          let coll = Infinity;
+          let step1 = Infinity;
+          let targetAlign = -1;
+
+          const desDir = rotateVec(prevDirX[i], prevDirY[i], angleDeg);
+          const limDir = limitTurn(prevDirX[i], prevDirY[i], desDir.x, desDir.y);
+          targetAlign = limDir.x * baseDirX + limDir.y * baseDirY;
+
+          if (!safe) {
+            score = BIG_PENALTY + (1 - targetAlign) * 10;
+          } else {
+            const res = predictCollisionsForActionLong(i, angleDeg, dv, prevDirX, prevDirY);
+            coll = res.collisions;
+            step1 = res.step1Collisions;
+
+            const dirPenalty = (1 - targetAlign) * 10;
+            score = coll + dirPenalty;
+
+            allowed.push({ angle: angleDeg, dv });
+
+            const better =
+              step1 < bestStep1 ||
+              (step1 === bestStep1 && (
+                coll < bestColl ||
+                (coll === bestColl && (
+                  targetAlign > bestTargetAlign ||
+                  (targetAlign === bestTargetAlign && (
+                    Math.abs(dv) < Math.abs(bestDv) ||
+                    (Math.abs(dv) === Math.abs(bestDv) && dv < bestDv)
+                  ))
+                ))
+              ));
+
+            if (better) {
+              bestStep1 = step1;
+              bestColl = coll;
+              bestAngle = angleDeg;
+              bestDv = dv;
+              bestTargetAlign = targetAlign;
+            }
+          }
+
+          scoresThisStep[key] = score;
+        }
+
+        safeControls[i] = allowed;
+        if (allowed.length === 0) {
+          needsEmergency[i] = true;
+        }
+
+        chosenAngles1[i] = bestAngle;
+        chosenDvs1[i] = bestDv;
+
+        controlScoreHistory[i].push(scoresThisStep);
+        if (controlScoreHistory[i].length > 4) {
+          controlScoreHistory[i].shift();
+        }
+      }
+
+      // Build plan for layer-1 only (controls from layer1)
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const b = ballsRight[i];
+        const ang1 = chosenAngles1[i];
+        const dv1 = chosenDvs1[i];
+
+        const des1 = rotateVec(prevDirX[i], prevDirY[i], ang1);
+        const lim1 = limitTurn(prevDirX[i], prevDirY[i], des1.x, des1.y);
+
+        planDir1X[i] = lim1.x;
+        planDir1Y[i] = lim1.y;
+        planSpeed1[i] = Math.max(1, b.baseSpeed + dv1);
+      }
+
+      // ===== LAYER 2 =====
+      const chosenAngles2 = new Array(NUM_BALLS).fill(0);
+      const chosenDvs2 = new Array(NUM_BALLS).fill(0);
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        if (needsEmergency[i]) continue;
+
+        let bestColl = Infinity;
+        let bestStep1 = Infinity;
+        let bestAngle = 0;
+        let bestDv = 0;
+        let bestTargetAlign = -Infinity;
+
+        const baseDirX = ballsRight[i].baseDirX;
+        const baseDirY = ballsRight[i].baseDirY;
+
+        const ang1 = chosenAngles1[i];
+        const dv1 = chosenDvs1[i];
+
+        for (const angleDeg2 of ACTION_ANGLES) {
+          for (const dv2 of ACTION_DVS) {
+            const totalAngle = ang1 + angleDeg2;
+            const totalDv = clampDv(dv1 + dv2);
+
+            const desDir = rotateVec(prevDirX[i], prevDirY[i], totalAngle);
+            const limDir = limitTurn(prevDirX[i], prevDirY[i], desDir.x, desDir.y);
+            const targetAlign = limDir.x * baseDirX + limDir.y * baseDirY;
+
+            const { collisions: coll, step1Collisions: step1 } =
+              predictCollisionsForActionShort(
+                i, angleDeg2, dv2,
+                chosenAngles1, chosenDvs1,
+                prevDirX, prevDirY
+              );
+
+            const better =
+              step1 < bestStep1 ||
+              (step1 === bestStep1 && (
+                coll < bestColl ||
+                (coll === bestColl && (
+                  targetAlign > bestTargetAlign ||
+                  (targetAlign === bestTargetAlign && (
+                    Math.abs(dv2) < Math.abs(bestDv) ||
+                    (Math.abs(dv2) === Math.abs(bestDv) && dv2 < bestDv)
+                  ))
+                ))
+              ));
+
+            if (better) {
+              bestStep1 = step1;
+              bestColl = coll;
+              bestAngle = angleDeg2;
+              bestDv = dv2;
+              bestTargetAlign = targetAlign;
+            }
+          }
+        }
+
+        chosenAngles2[i] = bestAngle;
+        chosenDvs2[i] = bestDv;
+      }
+
+      // Build plan for layers 1+2
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const b = ballsRight[i];
+        const ang1 = chosenAngles1[i];
+        const dv1 = chosenDvs1[i];
+        const ang2 = chosenAngles2[i];
+        const dv2 = chosenDvs2[i];
+
+        const angle12 = ang1 + ang2;
+        const dv12 = clampDv(dv1 + dv2);
+
+        const des2 = rotateVec(prevDirX[i], prevDirY[i], angle12);
+        const lim2 = limitTurn(prevDirX[i], prevDirY[i], des2.x, des2.y);
+
+        planDir2X[i] = lim2.x;
+        planDir2Y[i] = lim2.y;
+        planSpeed2[i] = Math.max(1, b.baseSpeed + dv12);
+      }
+
+      // ===== LAYER 3 =====
+      const chosenAngles3 = new Array(NUM_BALLS).fill(0);
+      const chosenDvs3 = new Array(NUM_BALLS).fill(0);
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        if (needsEmergency[i]) continue;
+
+        let bestColl = Infinity;
+        let bestStep1 = Infinity;
+        let bestAngle = 0;
+        let bestDv = 0;
+        let bestTargetAlign = -Infinity;
+
+        const baseDirX = ballsRight[i].baseDirX;
+        const baseDirY = ballsRight[i].baseDirY;
+
+        const ang1 = chosenAngles1[i];
+        const dv1 = chosenDvs1[i];
+        const ang2 = chosenAngles2[i];
+        const dv2 = chosenDvs2[i];
+        const angle12 = ang1 + ang2;
+        const dv12 = clampDv(dv1 + dv2);
+
+        for (const angleDeg3 of ACTION_ANGLES) {
+          for (const dv3 of ACTION_DVS) {
+            const totalAngle = angle12 + angleDeg3;
+            const totalDv = clampDv(dv12 + dv3);
+
+            const desDir = rotateVec(prevDirX[i], prevDirY[i], totalAngle);
+            const limDir = limitTurn(prevDirX[i], prevDirY[i], desDir.x, desDir.y);
+            const targetAlign = limDir.x * baseDirX + limDir.y * baseDirY;
+
+            const { collisions: coll, step1Collisions: step1 } =
+              predictCollisionsForActionThird(
+                i, angleDeg3, dv3,
+                chosenAngles1, chosenDvs1,
+                chosenAngles2, chosenDvs2,
+                prevDirX, prevDirY
+              );
+
+            const better =
+              step1 < bestStep1 ||
+              (step1 === bestStep1 && (
+                coll < bestColl ||
+                (coll === bestColl && (
+                  targetAlign > bestTargetAlign ||
+                  (targetAlign === bestTargetAlign && (
+                    Math.abs(dv3) < Math.abs(bestDv) ||
+                    (Math.abs(dv3) === Math.abs(bestDv) && dv3 < bestDv)
+                  ))
+                ))
+              ));
+
+            if (better) {
+              bestStep1 = step1;
+              bestColl = coll;
+              bestAngle = angleDeg3;
+              bestDv = dv3;
+              bestTargetAlign = targetAlign;
+            }
+          }
+        }
+
+        chosenAngles3[i] = bestAngle;
+        chosenDvs3[i] = bestDv;
+
+        ballsRight[i].immediateCollisionsForecast = (bestStep1 >= 500) ? bestStep1 : 0;
+      }
+
+      layerFrames++;
+      let used2 = 0;
+      let used3 = 0;
+      for (let i = 0; i < NUM_BALLS; i++) {
+        if (chosenAngles2[i] !== 0 || chosenDvs2[i] !== 0) used2++;
+        if (chosenAngles3[i] !== 0 || chosenDvs3[i] !== 0) used3++;
+      }
+      layer2Usage += used2;
+      layer3Usage += used3;
+
+      // 
+      // ===== LAYER-4: joint emergency re-planning based on relative velocities =====
+
+      // First, compute total (layer1+2+3) planned controls and corresponding directions/speeds.
+      const totalAngles = new Array(NUM_BALLS);
+      const totalDvs    = new Array(NUM_BALLS);
+      const planDirX    = new Array(NUM_BALLS);
+      const planDirY    = new Array(NUM_BALLS);
+      const planSpeed   = new Array(NUM_BALLS);
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const a1 = chosenAngles1[i];
+        const dv1 = chosenDvs1[i];
+        const a2 = chosenAngles2[i];
+        const dv2 = chosenDvs2[i];
+        const a3 = chosenAngles3[i];
+        const dv3 = chosenDvs3[i];
+
+        const totalAngle = a1 + a2 + a3;
+        const totalDv    = clampDv(dv1 + dv2 + dv3);
+
+        totalAngles[i] = totalAngle;
+        totalDvs[i]    = totalDv;
+
+        const desDir = rotateVec(prevDirX[i], prevDirY[i], totalAngle);
+        const limDir = limitTurn(prevDirX[i], prevDirY[i], desDir.x, desDir.y);
+
+        planDirX[i]  = limDir.x;
+        planDirY[i]  = limDir.y;
+        planSpeed[i] = Math.max(1, ballsRight[i].baseSpeed + totalDv);
+      }
+
+      // 1) Build graph using the NEW connectivity rule:
+      // Edge (i,j) exists iff there is a joint pair of controls
+      //   c1, c2 in {-45, -22, 0, 22, 45}
+      // with L4 dv mechanics, such that, when applied to the PREVIOUS velocity vectors
+      // (prevDirX/Y) and scalar speeds that brought the balls to current positions,
+      // balls i and j would collide at the NEXT step (distance <= TOUCH2_COLLIDE).
+      // Balls closer than R to a border are excluded; and only pairs with distance <= 10R are considered.
+
+      // Precompute which balls are eligible (not too close to border for L4 graph)
+      const l4Eligible = new Array(NUM_BALLS);
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const bi = ballsRight[i];
+        const distEdgeLeft   = bi.x - RADIUS;
+        const distEdgeRight  = (WIDTH  - RADIUS) - bi.x;
+        const distEdgeTop    = bi.y - RADIUS;
+        const distEdgeBottom = (HEIGHT - RADIUS) - bi.y;
+        const minEdgeDist = Math.min(distEdgeLeft, distEdgeRight, distEdgeTop, distEdgeBottom);
+        // Exclude if closer than R to any border (i.e. margin from edge < RADIUS)
+        l4Eligible[i] = (minEdgeDist >= RADIUS);
+      }
+
+      const adj = Array.from({ length: NUM_BALLS }, () => []);
+      const l4EdgesList = [];
+
+      // Angles used in L4 connectivity prognosis
+      const jointAngles = [-45, -22, 0, 22, 45];
+
+      
+      // Ensure L4 diagnostic buffers exist
+      if (!lastL4PosX) {
+        lastL4PosX = new Array(NUM_BALLS);
+        lastL4PosY = new Array(NUM_BALLS);
+        lastL4Speed = new Array(NUM_BALLS);
+      }
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const bi = ballsRight[i];
+
+        // For L4 prognosis, use worst-case acceleration:
+        // try dv = +1 based on the PREVIOUS scalar speed, but do not exceed
+        // the allowed maximum (baseSpeed + 1); if that would exceed, keep dv = 0.
+        let speedI = bi.speed;
+        const maxSpeedI = bi.baseSpeed + 1;
+        if (speedI + 1 <= maxSpeedI) {
+          speedI = speedI + 1;
+        }
+        // store L4 starting position and speed for diagnostics
+        if (lastL4PosX) {
+          lastL4PosX[i] = bi.x;
+          lastL4PosY[i] = bi.y;
+          lastL4Speed[i] = speedI;
+        }
+
+        // Skip balls too close to border from L4 graph
+        if (!l4Eligible[i]) continue;
+
+        for (let j = i + 1; j < NUM_BALLS; j++) {
+          const bj = ballsRight[j];
+
+          // Skip balls too close to border from L4 graph
+          if (!l4Eligible[j]) continue;
+
+          // NEW: only consider pairs that "see" each other: distance <= 10*R
+          const dx0 = bi.x - bj.x;
+          const dy0 = bi.y - bj.y;
+          if (dx0 * dx0 + dy0 * dy0 > MAX_NEIGHBOR_DIST2) {
+            continue;
+          }
+
+          let speedJ = bj.speed;
+          const maxSpeedJ = bj.baseSpeed + 1;
+          if (speedJ + 1 <= maxSpeedJ) {
+            speedJ = speedJ + 1;
+          }
+
+          let connected = false;
+          if (lastL4PosX) {
+            lastL4PosX[j] = bj.x;
+            lastL4PosY[j] = bj.y;
+            lastL4Speed[j] = speedJ;
+          }
+
+
+          // Try all joint controls (c1, c2) in {-45,-22,0,22,45} x {-45,-22,0,22,45}
+          for (let a1Idx = 0; a1Idx < jointAngles.length && !connected; a1Idx++) {
+            const ang1 = jointAngles[a1Idx];
+            const des1 = rotateVec(prevDirX[i], prevDirY[i], ang1);
+            const lim1 = limitTurn(prevDirX[i], prevDirY[i], des1.x, des1.y);
+            const vx1 = lim1.x * speedI;
+            const vy1 = lim1.y * speedI;
+
+            // Position of ball i at the next step under this control, with border clamping
+            let xiNext = bi.x + vx1;
+            let yiNext = bi.y + vy1;
+            if (xiNext < RADIUS) xiNext = RADIUS;
+            if (xiNext > WIDTH - RADIUS) xiNext = WIDTH - RADIUS;
+            if (yiNext < RADIUS) yiNext = RADIUS;
+            if (yiNext > HEIGHT - RADIUS) yiNext = HEIGHT - RADIUS;
+
+            for (let a2Idx = 0; a2Idx < jointAngles.length && !connected; a2Idx++) {
+              const ang2 = jointAngles[a2Idx];
+              const des2 = rotateVec(prevDirX[j], prevDirY[j], ang2);
+              const lim2 = limitTurn(prevDirX[j], prevDirY[j], des2.x, des2.y);
+              const vx2 = lim2.x * speedJ;
+              const vy2 = lim2.y * speedJ;
+
+              // Position of ball j at the next step under this control, with border clamping
+              let xjNext = bj.x + vx2;
+              let yjNext = bj.y + vy2;
+              if (xjNext < RADIUS) xjNext = RADIUS;
+              if (xjNext > WIDTH - RADIUS) xjNext = WIDTH - RADIUS;
+              if (yjNext < RADIUS) yjNext = RADIUS;
+              if (yjNext > HEIGHT - RADIUS) yjNext = HEIGHT - RADIUS;
+
+              const dx = xiNext - xjNext;
+              const dy = yiNext - yjNext;
+              if (dx * dx + dy * dy <= L4_CONNECT_DIST2) {
+                connected = true;
+              }
+            }
+          }
+
+          if (connected) {
+            adj[i].push(j);
+            adj[j].push(i);
+            l4EdgesList.push([i, j]);
+          }
+        }
+      }
+
+      // per-ball flag whether it has any layer-4 edges this step
+      const l4EdgeFlag = new Array(NUM_BALLS).fill(0);
+      const l4ComponentId = new Array(NUM_BALLS).fill(-1);
+      for (let i = 0; i < NUM_BALLS; i++) {
+        if (adj[i].length > 0) l4EdgeFlag[i] = 1;
+      }
+
+      // 2) Find connected components of this graph (only vertices with degree > 0).
+      const visitedComp = new Array(NUM_BALLS).fill(false);
+      const components = [];
+      for (let i = 0; i < NUM_BALLS; i++) {
+        if (visitedComp[i]) continue;
+        if (adj[i].length === 0) continue;
+
+        const queue = [i];
+        visitedComp[i] = true;
+        const comp = [];
+        for (let qh = 0; qh < queue.length; qh++) {
+          const v = queue[qh];
+          comp.push(v);
+          for (const u of adj[v]) {
+            if (!visitedComp[u]) {
+              visitedComp[u] = true;
+              queue.push(u);
+            }
+          }
+        }
+        if (comp.length > 0) {
+          const compIndex = components.length;
+          components.push(comp);
+          for (const node of comp) {
+            l4ComponentId[node] = compIndex;
+          }
+        }
+      }
+
+      // 3) For balls in components, override layer1-3 plan
+      //    using joint controls from set {-45, 0, +45} with dv = 0.
+      const finalAngles = totalAngles.slice();
+      const finalDvs    = totalDvs.slice();
+
+      const emergFlags  = new Array(NUM_BALLS).fill(0);
+      const emergAngles = new Array(NUM_BALLS).fill("no L4");
+
+      
+            function evaluateJointControlForComponent(
+        comp,
+        angleAssign,
+        basePlanDirX,
+        basePlanDirY,
+        basePlanSpeed
+      ) {
+        // Build next-step directions/speeds: component uses emergency angles w/ baseSpeed; others keep baseline.
+        const dirXNext = new Array(NUM_BALLS);
+        const dirYNext = new Array(NUM_BALLS);
+        const speedNext = new Array(NUM_BALLS);
+
+        for (let idx = 0; idx < comp.length; idx++) {
+          const i = comp[idx];
+          const ang = angleAssign[i];
+          const des = rotateVec(prevDirX[i], prevDirY[i], ang);
+          const lim = limitTurn(prevDirX[i], prevDirY[i], des.x, des.y);
+          dirXNext[i] = lim.x;
+          dirYNext[i] = lim.y;
+          speedNext[i] = ballsRight[i].baseSpeed;
+        }
+        for (let k = 0; k < NUM_BALLS; k++) {
+          if (dirXNext[k] === undefined) {
+            dirXNext[k] = basePlanDirX[k];
+            dirYNext[k] = basePlanDirY[k];
+            speedNext[k] = basePlanSpeed[k];
+          }
+        }
+
+        // stepCollisions[s] = number of collisions after step (s+1)
+        const stepCollisions = new Array(EMERGENCY_STEPS).fill(0);
+
+        // Temporary position buffers to avoid recomputing positions inside the pair loop.
+        const xs = new Array(NUM_BALLS);
+        const ys = new Array(NUM_BALLS);
+
+        for (let step = 1; step <= EMERGENCY_STEPS; step++) {
+          for (let i = 0; i < NUM_BALLS; i++) {
+            const bi = ballsRight[i];
+            let xi = bi.x + dirXNext[i] * speedNext[i] * step;
+            let yi = bi.y + dirYNext[i] * speedNext[i] * step;
+
+            if (xi < RADIUS) xi = RADIUS;
+            else if (xi > WIDTH - RADIUS) xi = WIDTH - RADIUS;
+            if (yi < RADIUS) yi = RADIUS;
+            else if (yi > HEIGHT - RADIUS) yi = HEIGHT - RADIUS;
+
+            xs[i] = xi;
+            ys[i] = yi;
+          }
+
+          let c = 0;
+          for (let i = 0; i < NUM_BALLS; i++) {
+            const xi = xs[i], yi = ys[i];
+            for (let j = i + 1; j < NUM_BALLS; j++) {
+              const dx = xi - xs[j];
+              const dy = yi - ys[j];
+              if (dx * dx + dy * dy <= TOUCH2_COLLIDE) c++;
+            }
+          }
+          stepCollisions[step - 1] = c;
+        }
+
+        // Compute maximum deviation (in degrees) from the direction to the target over the component.
+        let maxAbsAngle = 0;
+        for (let idx = 0; idx < comp.length; idx++) {
+          const i = comp[idx];
+          const targetDirX = ballsRight[i].baseDirX;
+          const targetDirY = ballsRight[i].baseDirY;
+          const angTarget = Math.atan2(targetDirY, targetDirX);
+          const angEmerg = Math.atan2(dirYNext[i], dirXNext[i]);
+          let delta = angEmerg - angTarget;
+          if (delta > Math.PI) delta -= 2 * Math.PI;
+          else if (delta < -Math.PI) delta += 2 * Math.PI;
+          const devDeg = Math.abs(delta * 180 / Math.PI);
+          if (devDeg > maxAbsAngle) maxAbsAngle = devDeg;
+        }
+
+        return { stepCollisions, maxAbsAngle };
+      }
+
+      for (const comp of components) {
+        const m = comp.length;
+        if (m === 0) continue;
+
+        const angleOptions = [-45, 0, 45];
+        const totalCombos = Math.pow(angleOptions.length, m);
+
+        // Prepare shuffled order of combo indices
+        const comboIndices = [];
+        for (let c = 0; c < totalCombos; c++) {
+          comboIndices.push(c);
+        }
+        for (let k = comboIndices.length - 1; k > 0; k--) {
+          const r = Math.floor(Math.random() * (k + 1));
+          const tmpIdx = comboIndices[k];
+          comboIndices[k] = comboIndices[r];
+          comboIndices[r] = tmpIdx;
+        }
+
+        let chosen = null;
+
+        function isBetterJointCandidate(a, b) {
+          if (!b) return true;
+          for (let s = 0; s < EMERGENCY_STEPS; s++) {
+            if (a.stepCollisions[s] < b.stepCollisions[s]) return true;
+            if (a.stepCollisions[s] > b.stepCollisions[s]) return false;
+          }
+          if (a.maxAbsAngle < b.maxAbsAngle) return true;
+          if (a.maxAbsAngle > b.maxAbsAngle) return false;
+          return false;
+        }
+
+        // Scan all shuffled controls; choose best lexicographically
+        for (let idxCombo = 0; idxCombo < comboIndices.length; idxCombo++) {
+          const combo = comboIndices[idxCombo];
+          const angleAssign = {};
+          let tmp = combo;
+          for (let idxBit = 0; idxBit < m; idxBit++) {
+            const i = comp[idxBit];
+            const choice = tmp % angleOptions.length;
+            tmp = Math.floor(tmp / angleOptions.length);
+            const ang = angleOptions[choice];
+            angleAssign[i] = ang;
+          }
+
+          const { stepCollisions, maxAbsAngle } =
+            evaluateJointControlForComponent(
+              comp,
+              angleAssign,
+              planDirX,
+              planDirY,
+              planSpeed
+            );
+
+          const cand = { angleAssign, stepCollisions, maxAbsAngle };
+          if (isBetterJointCandidate(cand, chosen)) {
+            chosen = cand;
+          }
+        }
+
+        if (logL4ComponentsToConsole && chosen) {
+          const compAngles = comp.map(i => ({ index: i, angle: chosen.angleAssign[i] }));
+          console.log('L4 component', comp, 'chosenAngles', compAngles,
+                      'stepCollisions', chosen.stepCollisions,
+                      'maxAbsAngle', chosen.maxAbsAngle);
+        }
+
+        for (let idx = 0; idx < comp.length; idx++) {
+          const i = comp[idx];
+          finalAngles[i] = chosen.angleAssign[i];
+          finalDvs[i]    = 0;
+          emergFlags[i]  = 1;
+          emergAngles[i] = chosen.angleAssign[i];
+        }
+      }
+
+      // Remember L4 graph info for visualization/highlighting
+      lastL4EdgeFlag = l4EdgeFlag.slice();
+      lastL4ComponentId = l4ComponentId.slice();
+      lastL4Edges = l4EdgesList.slice();
+
+      // Store post-layer-4 velocity vectors for the last executed step
+      lastStepL4Vx = new Array(NUM_BALLS);
+      lastStepL4Vy = new Array(NUM_BALLS);
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const des = rotateVec(prevDirX[i], prevDirY[i], finalAngles[i]);
+        const lim = limitTurn(prevDirX[i], prevDirY[i], des.x, des.y);
+        const sp = Math.max(1, ballsRight[i].baseSpeed + finalDvs[i]);
+        lastStepL4Vx[i] = lim.x * sp;
+        lastStepL4Vy[i] = lim.y * sp;
+      }
+
+      // ===== APPLY final (possibly adjusted by layer-4) controls =====
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const b = ballsRight[i];
+
+        const prevDirRealX = b.dirX;
+        const prevDirRealY = b.dirY;
+
+        const a1 = chosenAngles1[i];
+        const dv1 = chosenDvs1[i];
+        const a2 = chosenAngles2[i];
+        const dv2 = chosenDvs2[i];
+        const a3 = chosenAngles3[i];
+        const dv3 = chosenDvs3[i];
+
+        const totalAngle = finalAngles[i];
+        const totalDv    = finalDvs[i];
+
+        b.isSecondLevel =
+          (a2 !== 0 || dv2 !== 0 || a3 !== 0 || dv3 !== 0);
+
+        const desDir = rotateVec(prevDirX[i], prevDirY[i], totalAngle);
+        const limDir = limitTurn(prevDirX[i], prevDirY[i], desDir.x, desDir.y);
+
+        b.speed = Math.max(1, b.baseSpeed + totalDv);
+        b.dirX = limDir.x;
+        b.dirY = limDir.y;
+
+        const prevAng = Math.atan2(prevDirRealY, prevDirRealX);
+        const newAng  = Math.atan2(b.dirY, b.dirX);
+        let dAng = newAng - prevAng;
+        if (dAng > Math.PI) dAng -= 2 * Math.PI;
+        if (dAng < -Math.PI) dAng += 2 * Math.PI;
+        let angleUsed = dAng * 180 / Math.PI;
+        if (angleUsed > MAX_TURN_DEG) angleUsed = MAX_TURN_DEG;
+        if (angleUsed < -MAX_TURN_DEG) angleUsed = -MAX_TURN_DEG;
+
+        const dvUsed = totalDv;
+        const emergFlag = emergFlags[i] || 0;
+        const usedStr = `angle=${Math.round(angleUsed)},dv=${dvUsed},emergency=${emergFlag}`;
+        usedControlHistory[i].push(usedStr);
+        if (usedControlHistory[i].length > 4) usedControlHistory[i].shift();
+
+        const emergAngle = emergAngles[i];
+
+        layerDetailsHistory[i].push({
+          l1Angle: a1, l1Dv: dv1,
+          l2Angle: a2, l2Dv: dv2,
+          l3Angle: a3, l3Dv: dv3,
+          rtbAngle: totalAngles[i],
+          emergAngle: emergAngle,
+          emergFlag: emergFlag,
+          totalAngle: Math.round(angleUsed),
+          totalDv: totalDv,
+          geomAngle: angleUsed,
+          geomDv: dvUsed,
+          graphEdge: l4EdgeFlag[i]
+        });
+        if (layerDetailsHistory[i].length > 4) layerDetailsHistory[i].shift();
+      }
+
+      // Move, targets, history
+      for (let idx = 0; idx < NUM_BALLS; idx++) {
+        const b = ballsRight[idx];
+        b.framesSinceTarget++;
+
+        const dToTarget = Math.hypot(b.targetX - b.x, b.targetY - b.y);
+
+        if (dToTarget <= 1.5 * b.speed) {
+          b.x = b.targetX;
+          b.y = b.targetY;
+
+          totalFramesRight += b.framesSinceTarget;
+          completedTripsRight++;
+
+          pickTargetRight(b);
+          if (b.emergencyTimer > 0) {
+            b.emergencyTimer--;
+          }
+
+        } else {
+          let newX = b.x + b.dirX * b.speed;
+          let newY = b.y + b.dirY * b.speed;
+
+          if (newX < RADIUS) newX = RADIUS;
+          if (newX > WIDTH - RADIUS) newX = WIDTH - RADIUS;
+          if (newY < RADIUS) newY = RADIUS;
+          if (newY > HEIGHT - RADIUS) newY = HEIGHT - RADIUS;
+
+          b.x = newX;
+          b.y = newY;
+
+          if (b.emergencyTimer > 0) {
+            b.emergencyTimer--;
+          }
+
+          b.stepsSinceTargetChange++;
+        }
+
+        const vxHist = b.dirX * b.speed;
+        const vyHist = b.dirY * b.speed;
+
+        let vxL4 = 0;
+        let vyL4 = 0;
+        if (lastStepL4Vx && lastStepL4Vy) {
+          vxL4 = lastStepL4Vx[idx];
+          vyL4 = lastStepL4Vy[idx];
+        }
+
+        b.history.push({ x: b.x, y: b.y, vx: vxHist, vy: vyHist, vxL4: vxL4, vyL4: vyL4 });
+        if (b.history.length > 4) {
+          b.history.shift();
+        }
+      }
+
+      // collisions
+      for (const b of ballsRight) {
+        b.collisionType = 'none';
+        b.collisionRole = 'none';
+      }
+      const newPairs = new Set();
+      let add = 0;
+      let sharpAdd = 0;
+
+      const now = performance.now();
+      let firstNormalCollisionPair = null;
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        for (let j = i + 1; j < NUM_BALLS; j++) {
+          const a = ballsRight[i];
+          const b = ballsRight[j];
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          if (dx * dx + dy * dy <= TOUCH2_COLLIDE) {
+            const key = i + "-" + j;
+            newPairs.add(key);
+
+            const isSharpPair =
+              (a.stepsSinceTargetChange <= 3 ||
+               b.stepsSinceTargetChange <= 3);
+
+            if (isSharpPair) {
+              if (a.collisionType !== 'sharp') a.collisionType = 'sharp';
+              if (b.collisionType !== 'sharp') b.collisionType = 'sharp';
+            } else {
+              if (a.collisionType === 'none') a.collisionType = 'normal';
+              if (b.collisionType === 'none') b.collisionType = 'normal';
+            }
+
+            const aSafe =
+              (a.x > BORDER_SAFE &&
+               a.x < WIDTH - BORDER_SAFE &&
+               a.y > BORDER_SAFE &&
+               a.y < HEIGHT - BORDER_SAFE);
+            const bSafe =
+              (b.x > BORDER_SAFE &&
+               b.x < WIDTH - BORDER_SAFE &&
+               b.y > BORDER_SAFE &&
+               b.y < HEIGHT - BORDER_SAFE);
+
+            const countThis = aSafe && bSafe;
+
+            if (!prevPairsRight.has(key) && countThis) {
+              add++;
+              if (isSharpPair) {
+                sharpAdd++;
+              } else if (!firstNormalCollisionPair) {
+                firstNormalCollisionPair = { i, j };
+              }
+            }
+          }
+        }
+      }
+
+      prevPairsRight = newPairs;
+
+      if (firstNormalCollisionPair) {
+        const { i, j } = firstNormalCollisionPair;
+        ballsRight[i].collisionRole = 'primaryRed';
+        ballsRight[j].collisionRole = 'primaryOrange';
+      }
+
+      const normalAdd = add - sharpAdd;
+      for (let k = 0; k < normalAdd; k++) {
+        rightCollisionTimes.push(now);
+      }
+      while (rightCollisionTimes.length > 0 &&
+             rightCollisionTimes[0] < now - WINDOW_MS) {
+        rightCollisionTimes.shift();
+      }
+
+      const rate10 = rightCollisionTimes.length / 10;
+      statsRightCollDiv.textContent = `Collisions/10s: ${rate10.toFixed(2)}`;
+
+      sharpTurnCollisionsTotal += sharpAdd;
+      statsRightSharpDiv.textContent =
+        `Sharp-turn collisions (total): ${sharpTurnCollisionsTotal}`;
+
+      const avgFrames =
+        completedTripsRight > 0 ? totalFramesRight / completedTripsRight : 0;
+      statsRightFramesDiv.textContent =
+        `Avg frames to target: ${avgFrames.toFixed(1)}`;
+
+      if (layerFrames > 0) {
+        const layer2freq = layer2Usage / (layerFrames * NUM_BALLS);
+        const layer3freq = layer3Usage / (layerFrames * NUM_BALLS);
+
+        statsRightLayer2Div.textContent =
+          `Layer-2 usage: ${layer2freq.toFixed(3)}`;
+        statsRightLayer3Div.textContent =
+          `Layer-3 usage: ${layer3freq.toFixed(3)}`;
+      }
+
+      statsRightEmergencyDiv.textContent =
+        `Emergency events: ${emergencyEvents}`;
+
+      // === On first normal collision, snapshot + highlight L4 components ===
+      if (firstNormalCollisionPair && !paused) {
+        // Force highlighting of all L4 connected components on the right field
+        highlightL4Components = true;
+        pendingCollisionPair = firstNormalCollisionPair;
+      }
+    }
+
+    function drawRight() {
+      ctx2.clearRect(0, 0, WIDTH, HEIGHT);
+
+      // Draw L4 edges (faint green) between connected balls
+      if (highlightL4Components && lastL4Edges && lastL4Edges.length > 0) {
+        ctx2.save();
+        ctx2.strokeStyle = 'rgba(0,255,0,0.3)';
+        ctx2.lineWidth = 1;
+        for (const pair of lastL4Edges) {
+          const i = pair[0];
+          const j = pair[1];
+          const bi = ballsRight[i];
+          const bj = ballsRight[j];
+          ctx2.beginPath();
+          ctx2.moveTo(bi.x, bi.y);
+          ctx2.lineTo(bj.x, bj.y);
+          ctx2.stroke();
+        }
+        ctx2.restore();
+      }
+
+      for (let i = 0; i < NUM_BALLS; i++) {
+        const b = ballsRight[i];
+        ctx2.beginPath();
+        ctx2.arc(b.x, b.y, RADIUS, 0, Math.PI * 2);
+
+        if (b.collisionRole === 'primaryRed') {
+          ctx2.fillStyle = 'red';
+        } else if (b.collisionRole === 'primaryOrange') {
+          ctx2.fillStyle = 'orange';
+        } else if (i === TRACK_RIGHT_INDEX) {
+          ctx2.fillStyle = 'green';
+        } else if (b.emergencyTimer > 0) {
+          ctx2.fillStyle = 'purple';
+        } else if (b.isSecondLevel) {
+          ctx2.fillStyle = 'blue';
+        } else {
+          if (b.collisionType === 'sharp') {
+            ctx2.fillStyle = '#ffb347';
+          } else if (b.collisionType === 'normal') {
+            ctx2.fillStyle = 'red';
+          } else {
+            ctx2.fillStyle = 'black';
+          }
+        }
+
+        ctx2.fill();
+
+        // faint view circle around the green ball
+        if (i === TRACK_RIGHT_INDEX) {
+          ctx2.beginPath();
+          ctx2.arc(b.x, b.y, MAX_NEIGHBOR_DIST, 0, Math.PI * 2);
+          ctx2.strokeStyle = "rgba(180,180,180,0.25)";
+          ctx2.lineWidth = 1;
+          ctx2.stroke();
+        }
+
+        // Optional: highlight layer-4 connected components and show L4 emergency direction
+        if (highlightL4Components && lastL4ComponentId && lastL4ComponentId[i] >= 0) {
+          const compColor = L4_COMPONENT_COLORS[lastL4ComponentId[i] % L4_COMPONENT_COLORS.length];
+          ctx2.beginPath();
+          ctx2.arc(b.x, b.y, RADIUS + 2, 0, Math.PI * 2);
+          ctx2.strokeStyle = compColor;
+          ctx2.lineWidth = 2;
+          ctx2.stroke();
+
+          if (lastStepL4Vx && lastStepL4Vy && lastL4EdgeFlag && lastL4EdgeFlag[i]) {
+            drawArrow(ctx2, b.x, b.y, lastStepL4Vx[i] * 0.5, lastStepL4Vy[i] * 0.5, compColor);
+          }
+        }
+      }
+
+      const tb = ballsRight[TRACK_RIGHT_INDEX];
+      drawDestination(ctx2, tb.targetX, tb.targetY);
+
+      for (const b of ballsRight) {
+        if (b.collisionType === 'none') continue;
+        if (!b.alreadyHasTarget) continue;
+
+        let color;
+        if (b.collisionRole === 'primaryRed') {
+          color = 'red';
+        } else if (b.collisionRole === 'primaryOrange') {
+          color = 'orange';
+        } else if (b.collisionType === 'sharp') {
+          color = '#ffb347';
+        } else {
+          color = 'red';
+        }
+
+        const baseR = RADIUS * 1.8;
+        const smallR = baseR * 0.5;
+
+        drawTargetSign(ctx2, b.prevTargetX, b.prevTargetY, color, smallR);
+        drawTargetSign(ctx2, b.targetX, b.targetY, color, baseR);
+      }
+    }
+
+    function createZoomedCollisionSnapshot(i, j) {
+      const b1 = ballsRight[i];
+      const b2 = ballsRight[j];
+
+      const magCanvas = document.createElement('canvas');
+      magCanvas.width = 500;
+      magCanvas.height = 500;
+      const mctx = magCanvas.getContext('2d');
+
+      mctx.fillStyle = 'white';
+      mctx.fillRect(0, 0, magCanvas.width, magCanvas.height);
+
+      const cx = (b1.x + b2.x) / 2;
+      const cy = (b1.y + b2.y) / 2;
+      const SCALE = 5;
+
+      function worldToZoom(x, y) {
+        return {
+          x: magCanvas.width / 2 + (x - cx) * SCALE,
+          y: magCanvas.height / 2 + (y - cy) * SCALE
+        };
+      }
+
+      const HIST_RADIUS = RADIUS * SCALE;
+
+      function drawBigBall(ball, color, index) {
+        const p = worldToZoom(ball.x, ball.y);
+        mctx.beginPath();
+        mctx.arc(p.x, p.y, RADIUS, 0, Math.PI * 2);
+        mctx.fillStyle = color;
+        mctx.fill();
+
+        const textColor = (color === 'orange' || color === 'yellow') ? 'black' : 'white';
+        mctx.fillStyle = textColor;
+        mctx.font = '16px Arial';
+        mctx.textAlign = 'center';
+        mctx.textBaseline = 'middle';
+        mctx.fillText(index, p.x, p.y);
+      }
+
+      function drawHistory(ball, color) {
+        if (!ball.history) return;
+        const strokeCol = faintColor(color);
+        mctx.save();
+        mctx.lineWidth = 1;
+        const hist = ball.history;
+        for (let k = 0; k < hist.length; k++) {
+          const rec = hist[k];
+          const p = worldToZoom(rec.x, rec.y);
+          mctx.beginPath();
+          mctx.arc(p.x, p.y, HIST_RADIUS, 0, Math.PI * 2);
+          mctx.strokeStyle = strokeCol;
+          mctx.stroke();
+
+          let vx, vy;
+          if (k < hist.length - 1) {
+            const recNext = hist[k + 1];
+            const pNext = worldToZoom(recNext.x, recNext.y);
+            vx = pNext.x - p.x;
+            vy = pNext.y - p.y;
+          } else {
+            vx = rec.vx;
+            vy = rec.vy;
+          }
+          drawArrow(mctx, p.x, p.y, vx, vy, strokeCol);
+        }
+        mctx.restore();
+      }
+
+      function drawTargetsForBall(ball, color) {
+        const baseR = RADIUS * 1.8;
+        const smallR = baseR * 0.5;
+
+        if (ball.alreadyHasTarget) {
+          const pPrev = worldToZoom(ball.prevTargetX, ball.prevTargetY);
+          drawTargetSign(mctx, pPrev.x, pPrev.y, color, smallR);
+        }
+
+        const pCur = worldToZoom(ball.targetX, ball.targetY);
+        drawTargetSign(mctx, pCur.x, pCur.y, color, baseR);
+      }
+
+      drawHistory(b1, 'red');
+      drawHistory(b2, 'orange');
+
+      // Draw L4 (post-layer-4, pre-layer-5) direction at t-1 as gray arrow from second-to-last hollow circle
+      function drawL4ArrowForBall(ball) {
+        if (!ball.history || ball.history.length < 2) return;
+        const hist = ball.history;
+        const rec = hist[hist.length - 2];
+        const p = worldToZoom(rec.x, rec.y);
+        const vxL4 = rec.vxL4 || 0;
+        const vyL4 = rec.vyL4 || 0;
+        if (vxL4 === 0 && vyL4 === 0) return;
+        drawArrow(mctx, p.x, p.y, vxL4, vyL4, 'gray');
+      }
+
+      drawL4ArrowForBall(b1);
+      drawL4ArrowForBall(b2);
+
+      drawTargetsForBall(b1, 'red');
+      drawTargetsForBall(b2, 'orange');
+
+      for (let k = 0; k < NUM_BALLS; k++) {
+        if (k === i || k === j) continue;
+        const ob = ballsRight[k];
+        const pOb = worldToZoom(ob.x, ob.y);
+
+        mctx.beginPath();
+        mctx.arc(pOb.x, pOb.y, 2, 0, Math.PI * 2);
+        mctx.fillStyle = 'black';
+        mctx.fill();
+
+        mctx.font = '10px Arial';
+        mctx.textAlign = 'left';
+        mctx.textBaseline = 'bottom';
+        mctx.fillText(String(k), pOb.x + 3, pOb.y - 3);
+
+        const vxOb = ob.dirX * ob.speed * SCALE;
+        const vyOb = ob.dirY * ob.speed * SCALE;
+        drawArrow(mctx, pOb.x, pOb.y, vxOb, vyOb, 'black');
+      }
+
+      drawBigBall(b1, 'red', i);
+      drawBigBall(b2, 'orange', j);
+
+      mctx.strokeStyle = '#cccccc';
+      mctx.lineWidth = 1;
+      mctx.beginPath();
+      mctx.moveTo(magCanvas.width / 2 - 10, magCanvas.height / 2);
+      mctx.lineTo(magCanvas.width / 2 + 10, magCanvas.height / 2);
+      mctx.moveTo(magCanvas.width / 2, magCanvas.height / 2 - 10);
+      mctx.lineTo(magCanvas.width / 2, magCanvas.height / 2 + 10);
+      mctx.stroke();
+
+      const originX = magCanvas.width - 60;
+      const originY = magCanvas.height - 40;
+      drawArrow(mctx, originX, originY, 5, 0, 'gray');
+      drawArrow(mctx, originX, originY, 0, 5, 'gray');
+
+      downloadCanvasAsPNG(magCanvas, 'collision_zoom.png');
+    }
+
+    // NEW: snapshot of 5 candidate L4 positions per ball (for collided pair not in one L4 component)
+    
+    function createL4ControlsSnapshot(i, j) {
+      const b1 = ballsRight[i];
+      const b2 = ballsRight[j];
+
+      const magCanvas = document.createElement('canvas');
+      magCanvas.width = 500;
+      magCanvas.height = 500;
+      const mctx = magCanvas.getContext('2d');
+
+      mctx.fillStyle = 'white';
+      mctx.fillRect(0, 0, magCanvas.width, magCanvas.height);
+
+      // L4 starting positions (t-1) for the two balls.
+      const cx1 = (lastL4PosX && lastL4PosX[i] != null) ? lastL4PosX[i] : b1.x;
+      const cy1 = (lastL4PosY && lastL4PosY[i] != null) ? lastL4PosY[i] : b1.y;
+      const cx2 = (lastL4PosX && lastL4PosX[j] != null) ? lastL4PosX[j] : b2.x;
+      const cy2 = (lastL4PosY && lastL4PosY[j] != null) ? lastL4PosY[j] : b2.y;
+
+      const cx = (cx1 + cx2) / 2;
+      const cy = (cy1 + cy2) / 2;
+      const SCALE = 5;
+
+      function worldToZoom(x, y) {
+        return {
+          x: magCanvas.width / 2 + (x - cx) * SCALE,
+          y: magCanvas.height / 2 + (y - cy) * SCALE
+        };
+      }
+
+      function drawBigBallAtL4Pos(ballIndex, color) {
+        const bx = (lastL4PosX && lastL4PosX[ballIndex] != null)
+          ? lastL4PosX[ballIndex]
+          : ballsRight[ballIndex].x;
+        const by = (lastL4PosY && lastL4PosY[ballIndex] != null)
+          ? lastL4PosY[ballIndex]
+          : ballsRight[ballIndex].y;
+
+        const p = worldToZoom(bx, by);
+        mctx.beginPath();
+        mctx.arc(p.x, p.y, RADIUS, 0, Math.PI * 2);
+        mctx.fillStyle = color;
+        mctx.fill();
+
+        const textColor = (color === 'orange' || color === 'yellow') ? 'black' : 'white';
+        mctx.fillStyle = textColor;
+        mctx.font = '16px Arial';
+        mctx.textAlign = 'center';
+        mctx.textBaseline = 'middle';
+        mctx.fillText(String(ballIndex), p.x, p.y);
+      }
+
+      function drawL4Fan(ballIndex, color) {
+        const ball = ballsRight[ballIndex];
+
+        // direction basis = prevDir used in L4 (stored for this frame)
+        const pdx = (lastPrevDirX && lastPrevDirX.length === NUM_BALLS)
+          ? lastPrevDirX[ballIndex]
+          : ball.dirX;
+        const pdy = (lastPrevDirY && lastPrevDirY.length === NUM_BALLS)
+          ? lastPrevDirY[ballIndex]
+          : ball.dirY;
+
+        // scalar speed that L4 actually used in prognosis for this ball
+        const speed = (lastL4Speed && lastL4Speed[ballIndex] != null)
+          ? lastL4Speed[ballIndex]
+          : ball.speed;
+
+        const startX = (lastL4PosX && lastL4PosX[ballIndex] != null)
+          ? lastL4PosX[ballIndex]
+          : ball.x;
+        const startY = (lastL4PosY && lastL4PosY[ballIndex] != null)
+          ? lastL4PosY[ballIndex]
+          : ball.y;
+
+        const ANGLES = [-45, -22, 0, 22, 45];
+        const strokeCol = faintColor(color);
+
+        mctx.save();
+        mctx.lineWidth = 1;
+        mctx.strokeStyle = strokeCol;
+
+        for (let k = 0; k < ANGLES.length; k++) {
+          const ang = ANGLES[k];
+          const des = rotateVec(pdx, pdy, ang);
+          const lim = limitTurn(pdx, pdy, des.x, des.y);
+          let vx = lim.x * speed;
+          let vy = lim.y * speed;
+
+          let xNext = startX + vx;
+          let yNext = startY + vy;
+          if (xNext < RADIUS) xNext = RADIUS;
+          if (xNext > WIDTH - RADIUS) xNext = WIDTH - RADIUS;
+          if (yNext < RADIUS) yNext = RADIUS;
+          if (yNext > HEIGHT - RADIUS) yNext = HEIGHT - RADIUS;
+
+          const pNext = worldToZoom(xNext, yNext);
+
+          mctx.beginPath();
+          mctx.arc(pNext.x, pNext.y, RADIUS, 0, Math.PI * 2);
+          mctx.stroke();
+
+          mctx.font = '10px Arial';
+          mctx.fillStyle = 'black';
+          mctx.textAlign = 'center';
+          mctx.textBaseline = 'middle';
+          mctx.fillText(String(ang), pNext.x, pNext.y);
+        }
+
+        mctx.restore();
+      }
+
+      // draw L4 starting positions of the pair
+      drawBigBallAtL4Pos(i, 'red');
+      drawBigBallAtL4Pos(j, 'orange');
+
+      // draw 5 candidate next positions for each ball (what L4 actually checked)
+      drawL4Fan(i, 'red');
+      drawL4Fan(j, 'orange');
+
+      // small crosshair at center of zoom
+      mctx.strokeStyle = '#cccccc';
+      mctx.lineWidth = 1;
+      mctx.beginPath();
+      mctx.moveTo(magCanvas.width / 2 - 10, magCanvas.height / 2);
+      mctx.lineTo(magCanvas.width / 2 + 10, magCanvas.height / 2);
+      mctx.moveTo(magCanvas.width / 2, magCanvas.height / 2 - 10);
+      mctx.lineTo(magCanvas.width / 2, magCanvas.height / 2 + 10);
+      mctx.stroke();
+
+      downloadCanvasAsPNG(magCanvas, 'collision_L4_controls.png');
+    }
+function loop() {
+      if (paused) return;
+
+      updateLeft();
+      drawLeft();
+
+      updateRight();
+      drawRight();
+
+      if (pendingCollisionPair && !paused) {
+        const i = pendingCollisionPair.i;
+        const j = pendingCollisionPair.j;
+
+        // Always create normal zoom snapshot
+        createZoomedCollisionSnapshot(i, j);
+
+        // If balls were NOT in one L4 connected component, create extra snapshot
+        let sameComponent = false;
+        if (lastL4ComponentId &&
+            lastL4ComponentId[i] >= 0 &&
+            lastL4ComponentId[j] >= 0 &&
+            lastL4ComponentId[i] === lastL4ComponentId[j]) {
+          sameComponent = true;
+        }
+        if (!sameComponent) {
+          createL4ControlsSnapshot(i, j);
+        }
+
+        createCollisionLogXLSX(i, j);
+        pendingCollisionPair = null;
+        paused = true;
+        return;
+      }
+
+      if (!paused) {
+        requestNextFrame();
+      }
+    }
+
+    window.addEventListener('keydown', (e) => {
+      // Visualization pacing only (no model change)
+      if (e.key === '+' || e.key === '=') {
+        visFps = Math.min(DEFAULT_VIS_FPS, visFps + 5);
+        console.log('visFps:', visFps);
+        return;
+      }
+      if (e.key === '-') {
+        visFps = Math.max(0, visFps - 5);
+        console.log('visFps:', visFps);
+        return;
+      }
+
+      if (e.code === 'Space' && paused) {
+        paused = false;
+        requestNextFrame();
+      } else if (e.code === 'KeyH') {
+        highlightL4Components = !highlightL4Components;
+        console.log('Highlight L4 components:', highlightL4Components);
+      } else if (e.code === 'KeyL') {
+        logL4ComponentsToConsole = !logL4ComponentsToConsole;
+        console.log('Log L4 components to console:', logL4ComponentsToConsole);
+      }
+    });
+
+    requestNextFrame();
+  });
+  </script>
+</body>
+</html>
