@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Two Fields with Moving Balls</title>
+  <style>
+    body {
+      background: #111;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      height: 100vh;
+      margin: 0;
+      color: #eee;
+      font-family: sans-serif;
+    }
+    #wrapper {
+      display: flex;
+      gap: 40px;
+      align-items: flex-start;
+      margin-top: 20px;
+    }
+    .panel {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .panel-title {
+      margin-bottom: 8px;
+      font-weight: bold;
+      font-size: 16px;
+    }
+    canvas {
+      background: #ffffff;
+      border: 1px solid #000000;
+    }
+    .stats-block {
+      margin-top: 8px;
+      text-align: center;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrapper">
+    <div class="panel">
+      <div class="panel-title">No collision avoidance</div>
+      <canvas id="field1" width="500" height="500"></canvas>
+      <div class="stats-block">
+        <div id="stats-left-coll">Collisions/10s: 0.00</div>
+        <div id="stats-left-frames">Avg frames to target: 0.0</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Avoid collisions</div>
+      <canvas id="field2" width="500" height="500"></canvas>
+      <div class="stats-block">
+        <div id="stats-right-coll">Collisions/10s: 0.00</div>
+        <div id="stats-right-frames">Avg frames to target: 0.0</div>
+        <div id="stats-right-layer2">Layer-2 usage: 0.000</div>
+        <div id="stats-right-layer3">Layer-3 usage: 0.000</div>
+        <div id="stats-right-emergency">Emergency events: 0</div>
+        <div id="stats-right-sharp">Sharp-turn collisions (total): 0</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats-block" id="hotkeys">
+    Hotkeys: Space - resume after pause; H - toggle L4 components highlight; L - toggle L4 components logging; + / - - faster / slower visualization (caps at default, can slow to 0).
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
