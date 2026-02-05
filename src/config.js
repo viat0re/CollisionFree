@@ -3,21 +3,21 @@
 export const WIDTH = 500;
 export const HEIGHT = 500;
 export const NUM_BALLS = 50;
-export const RADIUS = 10;
+export const RADIUS = 7;
 export const BASE_SPEED = RADIUS;
 
 export const TRACK_LEFT_INDEX = 0;
 export const TRACK_RIGHT_INDEX = 0;
 
-export const AVOID_DIST = 2 * RADIUS;
+export const AVOID_DIST = 2.6 * RADIUS;
 export const TOUCH2_AVOID = AVOID_DIST * AVOID_DIST;
-export const TOUCH2_COLLIDE = RADIUS * RADIUS;
-export const BORDER_SAFE = 2 * BASE_SPEED;
+export const TOUCH2_COLLIDE = (2 * RADIUS) * (2 * RADIUS);
+export const BORDER_SAFE = AVOID_DIST + 2 * BASE_SPEED;
 
 export const MAX_NEIGHBOR_DIST = 10 * RADIUS;
 export const MAX_NEIGHBOR_DIST2 = MAX_NEIGHBOR_DIST * MAX_NEIGHBOR_DIST;
 
-export const L4_CONNECT_DIST = 1.25 * RADIUS;
+export const L4_CONNECT_DIST = 1.25 * (2 * RADIUS);
 export const L4_CONNECT_DIST2 = L4_CONNECT_DIST * L4_CONNECT_DIST;
 
 export const DISCOUNT_A = 0.9;
